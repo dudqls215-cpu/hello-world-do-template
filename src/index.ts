@@ -1,71 +1,132 @@
+// @ts-nocheck
+// 픽셀 RPG 방 서버 — Cloudflare Workers + Durable Objects (무료 플랜)
+// 훈련장 방 하나가 Durable Object 하나다. 접속한 사람이 보낸 "내 상태"(위치·방향·직업·동작)를 같은 방의 다른 사람에게 전달만 한다.
+// 주소: wss://<서버 주소>/ws/train-1 … train-9   ·   https://<서버 주소>/ 를 열면 "ok" 가 보인다.
 import { DurableObject } from "cloudflare:workers";
 
-/**
- * Welcome to Cloudflare Workers! This is your first Durable Objects application.
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your Durable Object in action
- * - Run `npm run deploy` to publish your application
- *
- * Bind resources to your worker in `wrangler.jsonc`. After adding bindings, a type definition for the
- * `Env` object can be regenerated with `npm run cf-typegen`.
- *
- * Learn more at https://developers.cloudflare.com/durable-objects
- */
+const CAP = 12; // 방 하나에 들어갈 수 있는 사람 수. 꽉 차면 닫힘 코드 4001 로 돌려보내고, 게임이 다음 방을 찾는다
+const MAX_LEN = 160; // 받는 메시지의 최대 길이(글자)
+const MAX_RATE = 30; // 한 사람이 1초에 보낼 수 있는 메시지 수. 넘는 것은 버린다
+const CLASSES = ["gs", "sw", "sm", "en", "ar", "gn"];
 
-/** A Durable Object's behavior is defined in an exported Javascript class */
-export class MyDurableObject extends DurableObject<Env> {
-	/**
-	 * The constructor is invoked once upon creation of the Durable Object, i.e. the first call to
-	 * 	`DurableObjectStub::get` for a given identifier (no-op constructors can be omitted)
-	 *
-	 * @param ctx - The interface for interacting with Durable Object state
-	 * @param env - The interface to reference bindings declared in wrangler.jsonc
-	 */
-	constructor(ctx: DurableObjectState, env: Env) {
+// 받은 상태를 검사해서 깨끗한 값만 남긴다. 이상하면 null (전달하지 않음)
+function clean(m) {
+	if (!m || typeof m !== "object" || m.t !== "s") return null;
+	const x = Number(m.x), q = Number(m.q);
+	if (!Number.isFinite(x) || !Number.isFinite(q)) return null;
+	if (!CLASSES.includes(m.c)) return null;
+	if (typeof m.a !== "string" || !/^[a-z0-9]{1,12}$/.test(m.a)) return null;
+	return { x: Math.round(Math.max(0, Math.min(640, x)) * 10) / 10, f: m.f < 0 ? -1 : 1, c: m.c, a: m.a, q: Math.max(0, Math.min(65535, Math.floor(q))), g: m.g ? 1 : 0 };
+}
+
+export class MyDurableObject extends DurableObject {
+	constructor(ctx, env) {
 		super(ctx, env);
+		// 살아 있는지 묻는 "p" 에는 방을 깨우지 않고 "o" 로 답하게 한다. 이 기능이 없는 환경이면 아래 webSocketMessage 가 직접 답한다
+		try {
+			this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("p", "o"));
+		} catch (e) {
+			// not available here: answered by hand below
+		}
 	}
 
-	/**
-	 * The Durable Object exposes an RPC method sayHello which will be invoked when a Durable
-	 *  Object instance receives a request from a Worker via the same method invocation on the stub
-	 *
-	 * @returns The greeting to be sent back to the Worker
-	 */
-	async sayHello(): Promise<string> {
-		let result = this.ctx.storage.sql
-			.exec("SELECT 'Hello, World!' as greeting")
-			.one() as { greeting: string };
-		return result.greeting;
+	// 새 접속. 방이 차 있으면 4001 로 닫는다. 아니면 번호를 주고, 지금 방에 있는 사람들의 마지막 상태를 알려 준다
+	async fetch(request) {
+		const pair = new WebSocketPair();
+		const client = pair[0], server = pair[1];
+		const here = this.ctx.getWebSockets();
+		if (here.length >= CAP) {
+			server.accept();
+			server.close(4001, "full");
+			return new Response(null, { status: 101, webSocket: client });
+		}
+		this.ctx.acceptWebSocket(server); // 쉬는 동안에는 요금이 붙지 않는 방식(Hibernation)
+		const id = 1 + Math.floor(Math.random() * 2147483646);
+		server.serializeAttachment({ id, s: null, w: 0, n: 0 });
+		const who = [];
+		for (const ws of here) {
+			const a = ws.deserializeAttachment();
+			if (a && a.s) who.push([a.id, a.s]);
+		}
+		server.send(JSON.stringify({ t: "hi", id, cap: CAP, who }));
+		return new Response(null, { status: 101, webSocket: client });
+	}
+
+	// 누군가의 상태가 왔다: 검사하고, 기억해 두고, 같은 방의 다른 사람들에게 전달
+	async webSocketMessage(ws, message) {
+		if (typeof message !== "string" || message.length > MAX_LEN) return;
+		if (message === "p") {
+			try {
+				ws.send("o");
+			} catch (e) {
+				// closing
+			}
+			return;
+		}
+		const at = ws.deserializeAttachment();
+		if (!at) return;
+		const sec = Math.floor(Date.now() / 1000);
+		if (at.w !== sec) {
+			at.w = sec;
+			at.n = 0;
+		}
+		at.n++;
+		let s = null;
+		if (at.n <= MAX_RATE) {
+			try {
+				s = clean(JSON.parse(message));
+			} catch (e) {
+				s = null;
+			}
+		}
+		if (s) at.s = s;
+		ws.serializeAttachment(at);
+		if (!s) return;
+		this.tell(at.id, JSON.stringify({ t: "s", id: at.id, x: s.x, f: s.f, c: s.c, a: s.a, q: s.q, g: s.g }));
+	}
+
+	async webSocketClose(ws, code, reason, wasClean) {
+		this.left(ws);
+		try {
+			if (code >= 1000 && code < 5000 && ![1004, 1005, 1006, 1015].includes(code)) ws.close(code, reason);
+			else ws.close();
+		} catch (e) {
+			// already closed
+		}
+	}
+
+	async webSocketError(ws, error) {
+		this.left(ws);
+	}
+
+	// 나간 사람을 다른 사람들에게 알린다
+	left(ws) {
+		const at = ws.deserializeAttachment();
+		if (at) this.tell(at.id, JSON.stringify({ t: "bye", id: at.id }));
+	}
+
+	// 보낸 사람(번호 from)을 뺀 방 안의 모두에게 보낸다
+	tell(from, text) {
+		for (const o of this.ctx.getWebSockets()) {
+			const a = o.deserializeAttachment();
+			if (!a || a.id === from) continue;
+			try {
+				o.send(text);
+			} catch (e) {
+				// that connection is closing
+			}
+		}
 	}
 }
 
 export default {
-	/**
-	 * This is the standard fetch handler for a Cloudflare Worker
-	 *
-	 * @param request - The request submitted to the Worker from the client
-	 * @param env - The interface to reference bindings declared in wrangler.jsonc
-	 * @param ctx - The execution context of the Worker
-	 * @returns The response to be sent back to the client
-	 */
-	async fetch(request, env, ctx): Promise<Response> {
-		// Create a `DurableObjectId` for an instance of the `MyDurableObject`
-		// class. The name of class is used to identify the Durable Object.
-		// Requests from all Workers to the instance named
-		// will go to a single globally unique Durable Object instance.
-		const id: DurableObjectId = env.MY_DURABLE_OBJECT.idFromName(
-			new URL(request.url).pathname,
-		);
-
-		// Create a stub to open a communication channel with the Durable
-		// Object instance.
-		const stub = env.MY_DURABLE_OBJECT.get(id);
-
-		// Call the `sayHello()` RPC method on the stub to invoke the method on
-		// the remote Durable Object instance
-		const greeting = await stub.sayHello();
-
-		return new Response(greeting);
+	async fetch(request, env) {
+		const url = new URL(request.url);
+		const m = /^\/ws\/train-([1-9])$/.exec(url.pathname);
+		if (!m) return new Response("pixel rpg room server: ok", { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
+		if ((request.headers.get("Upgrade") || "").toLowerCase() !== "websocket") return new Response("websocket only", { status: 426 });
+		const ns = Object.values(env).find((v) => v && typeof v.idFromName === "function"); // the Durable Object binding, whatever it is called
+		if (!ns) return new Response("no durable object binding", { status: 500 });
+		return ns.get(ns.idFromName("train-" + m[1])).fetch(request);
 	},
-} satisfies ExportedHandler<Env>;
+};
