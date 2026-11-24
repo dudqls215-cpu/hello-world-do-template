@@ -1,36 +1,57 @@
 // @ts-nocheck
-// 픽셀 RPG 방 서버 — Cloudflare Workers + Durable Objects (무료 플랜)
+// 픽셀 RPG 방 서버 v4 — Cloudflare Workers + Durable Objects (무료 플랜)
 // 훈련장 방 하나가 Durable Object 하나다. 접속한 사람이 보낸 "내 상태"(위치·방향·직업·동작)를 같은 방의 다른 사람에게 전달만 한다.
 // 상태 말고 "작은 사건"(예: 적이 공격을 시작함, 허수아비가 맞음)도 전달한다: 이름 하나 + 숫자 몇 개. 무슨 뜻인지는 게임이 정하고, 서버는 모양만 검사한다.
-// 주소: wss://<서버 주소>/ws/train-1 … train-9   ·   https://<서버 주소>/ 를 열면 "ok" 가 보인다.
+// (v4) 닉네임: 방 안에서 "내 이름과 번호"를 알리면 기억했다가 새로 온 사람에게도 알려 준다.
+// (v4) 로비: 방과 따로, 모든 사람이 한 곳(lobby)에 접속해 "나는 누구이고 어디 있다"를 알린다. 친구가 지금 접속해 있는지, 어디 있는지 묻고,
+//      번호를 아는 사람에게 짧은 쪽지(친구 신청·파티 신청·파티 체력)를 보낸다. 로비도 같은 Durable Object 종류를 쓰므로 Cloudflare 설정은 그대로다.
+// 주소: wss://<서버 주소>/ws/train-1 … train-9 · wss://<서버 주소>/ws/lobby   ·   https://<서버 주소>/ 를 열면 "ok" 가 보인다.
 import { DurableObject } from "cloudflare:workers";
 
 const CAP = 12; // 방 하나에 들어갈 수 있는 사람 수. 꽉 차면 닫힘 코드 4001 로 돌려보내고, 게임이 다음 방을 찾는다
+const LOBBY_CAP = 400; // 로비에 동시에 접속할 수 있는 사람 수
 const MAX_LEN = 160; // 받는 메시지의 최대 길이(글자)
 const MAX_RATE = 30; // 한 사람이 1초에 보낼 수 있는 메시지 수. 넘는 것은 버린다
-const CLASSES = ["gs", "sw", "sm", "en", "ar", "gn"];
+const CLASS = /^[a-z]{2}$/; // 직업 이름은 영문 소문자 두 글자면 받는다. 어떤 직업이 있는지는 게임이 안다 — 직업이 늘어도 서버를 바꿀 필요가 없다
+const CODE = /^[a-z0-9]{8}$/; // (v4) 사람 번호: 게임이 기기마다 한 번 만든 영문 소문자·숫자 8자
+const NAME = /^[가-힣a-zA-Z0-9]{1,12}$/; // (v4) 닉네임: 한글·영문·숫자 12자까지
+const WHERE = /^[a-z]{1,8}-[1-9]$/; // (v4) 어디 있는지: 장소 이름-방 번호 (예: lab-3)
+const NOTE = /^[a-z0-9,]{0,60}$/; // (v4) 쪽지에 붙는 짧은 글(파티원 번호 목록 등)
 
 // 받은 상태를 검사해서 깨끗한 값만 남긴다. 이상하면 null (전달하지 않음)
 function clean(m) {
 	if (!m || typeof m !== "object" || m.t !== "s") return null;
 	const x = Number(m.x), q = Number(m.q);
 	if (!Number.isFinite(x) || !Number.isFinite(q)) return null;
-	if (!CLASSES.includes(m.c)) return null;
+	if (typeof m.c !== "string" || !CLASS.test(m.c)) return null;
 	if (typeof m.a !== "string" || !/^[a-z0-9]{1,12}$/.test(m.a)) return null;
 	return { x: Math.round(Math.max(0, Math.min(640, x)) * 10) / 10, f: m.f < 0 ? -1 : 1, c: m.c, a: m.a, q: Math.max(0, Math.min(65535, Math.floor(q))), g: m.g ? 1 : 0 };
+}
+
+// 숫자 목록: 6개 이하, 각각 ±100000 안, 소수 한 자리. 이상하면 null
+function nums(v) {
+	if (!Array.isArray(v) || v.length > 6) return null;
+	const out = [];
+	for (const n of v) {
+		if (typeof n !== "number" || !Number.isFinite(n)) return null;
+		out.push(Math.round(Math.max(-100000, Math.min(100000, n)) * 10) / 10);
+	}
+	return out;
 }
 
 // 작은 사건: { t: "e", k: 이름(영문 소문자 1~6자), v: 숫자 6개 이하 }. 이상하면 null (전달하지 않음)
 function cleanEvent(m) {
 	if (!m || typeof m !== "object" || m.t !== "e") return null;
 	if (typeof m.k !== "string" || !/^[a-z]{1,6}$/.test(m.k)) return null;
-	if (!Array.isArray(m.v) || m.v.length > 6) return null;
-	const v = [];
-	for (const n of m.v) {
-		if (typeof n !== "number" || !Number.isFinite(n)) return null;
-		v.push(Math.round(Math.max(-100000, Math.min(100000, n)) * 10) / 10);
-	}
-	return { k: m.k, v };
+	const v = nums(m.v);
+	return v ? { k: m.k, v } : null;
+}
+
+// (v4) 방 안에서 내 이름: { t: "n", u: 번호, n: 닉네임 }. 이상하면 null
+function cleanName(m) {
+	if (!m || typeof m !== "object" || m.t !== "n") return null;
+	if (typeof m.u !== "string" || !CODE.test(m.u) || typeof m.n !== "string" || !NAME.test(m.n)) return null;
+	return { u: m.u, n: m.n };
 }
 
 export class MyDurableObject extends DurableObject {
@@ -44,25 +65,30 @@ export class MyDurableObject extends DurableObject {
 		}
 	}
 
-	// 새 접속. 방이 차 있으면 4001 로 닫는다. 아니면 번호를 주고, 지금 방에 있는 사람들의 마지막 상태를 알려 준다
+	// 새 접속. 방이 차 있으면 4001 로 닫는다. 아니면 번호를 주고, 지금 방에 있는 사람들의 마지막 상태(와 이름)를 알려 준다
 	async fetch(request) {
+		const lobby = new URL(request.url).pathname === "/ws/lobby";
 		const pair = new WebSocketPair();
 		const client = pair[0], server = pair[1];
 		const here = this.ctx.getWebSockets();
-		if (here.length >= CAP) {
+		if (here.length >= (lobby ? LOBBY_CAP : CAP)) {
 			server.accept();
 			server.close(4001, "full");
 			return new Response(null, { status: 101, webSocket: client });
 		}
 		this.ctx.acceptWebSocket(server); // 쉬는 동안에는 요금이 붙지 않는 방식(Hibernation)
 		const id = 1 + Math.floor(Math.random() * 2147483646);
-		server.serializeAttachment({ id, s: null, w: 0, n: 0 });
+		server.serializeAttachment({ id, s: null, w: 0, n: 0, lobby, u: null, nm: null, c: null, l: 0, at: null });
+		if (lobby) {
+			server.send(JSON.stringify({ t: "hi", id, lobby: 1 }));
+			return new Response(null, { status: 101, webSocket: client });
+		}
 		const who = [];
 		for (const ws of here) {
 			const a = ws.deserializeAttachment();
-			if (a && a.s) who.push([a.id, a.s]);
+			if (a && a.s) who.push(a.u ? [a.id, a.s, a.nm, a.u] : [a.id, a.s]);
 		}
-		server.send(JSON.stringify({ t: "hi", id, cap: CAP, who }));
+		server.send(JSON.stringify({ t: "hi", id, cap: CAP, who, v: 4 }));
 		return new Response(null, { status: 101, webSocket: client });
 	}
 
@@ -85,21 +111,90 @@ export class MyDurableObject extends DurableObject {
 			at.n = 0;
 		}
 		at.n++;
-		let s = null, ev = null;
+		let m = null;
 		if (at.n <= MAX_RATE) {
 			try {
-				const m = JSON.parse(message);
-				s = clean(m);
-				if (!s) ev = cleanEvent(m);
+				m = JSON.parse(message);
 			} catch (e) {
-				s = null;
-				ev = null;
+				m = null;
 			}
 		}
+		if (at.lobby) {
+			this.lobbyMessage(ws, at, m);
+			return;
+		}
+		const s = clean(m), ev = s ? null : cleanEvent(m), nm = s || ev ? null : cleanName(m);
 		if (s) at.s = s;
+		if (nm) {
+			at.u = nm.u;
+			at.nm = nm.n;
+		}
 		ws.serializeAttachment(at);
 		if (s) this.tell(at.id, JSON.stringify({ t: "s", id: at.id, x: s.x, f: s.f, c: s.c, a: s.a, q: s.q, g: s.g }));
 		else if (ev) this.tell(at.id, JSON.stringify({ t: "e", id: at.id, k: ev.k, v: ev.v })); // 사건은 기억하지 않고 전달만 한다
+		else if (nm) this.tell(at.id, JSON.stringify({ t: "n", id: at.id, u: nm.u, n: nm.n }));
+	}
+
+	// (v4) 로비에 온 메시지
+	//   { t: "me", u, n, c, l, w }  나는 누구(번호·닉네임·직업·레벨)이고 어디(장소-방) 있다 — 기억해 둔다
+	//   { t: "q", l: [번호…] }       이 사람들 지금 접속해 있나? → { t: "qa", l: [[번호, 닉네임, 직업, 레벨, 장소]…] } (접속한 사람만)
+	//   { t: "d", to, k, v, s }      번호 to 인 사람에게 쪽지 → 그 사람에게 { t: "d", from, n, c, l, w, k, v, s }. 없으면 나에게 { t: "nf", to, k }
+	lobbyMessage(ws, at, m) {
+		if (!m || typeof m !== "object") return;
+		if (m.t === "me") {
+			if (typeof m.u !== "string" || !CODE.test(m.u) || typeof m.n !== "string" || !NAME.test(m.n)) return;
+			if (typeof m.c !== "string" || !CLASS.test(m.c) || typeof m.w !== "string" || !WHERE.test(m.w)) return;
+			at.u = m.u;
+			at.nm = m.n;
+			at.c = m.c;
+			at.l = Math.max(1, Math.min(99, Math.floor(Number(m.l)) || 1));
+			at.at = m.w;
+			ws.serializeAttachment(at);
+			return;
+		}
+		ws.serializeAttachment(at);
+		if (!at.u) return; // 자기소개 전에는 묻거나 쪽지를 보낼 수 없다
+		if (m.t === "q") {
+			if (!Array.isArray(m.l) || m.l.length > 12) return;
+			const want = new Set(m.l.filter((u) => typeof u === "string" && CODE.test(u)));
+			const seen = new Map();
+			for (const o of this.ctx.getWebSockets()) {
+				const a = o.deserializeAttachment();
+				if (a && a.u && want.has(a.u)) seen.set(a.u, [a.u, a.nm, a.c, a.l, a.at]);
+			}
+			try {
+				ws.send(JSON.stringify({ t: "qa", l: [...seen.values()] }));
+			} catch (e) {
+				// closing
+			}
+			return;
+		}
+		if (m.t === "d") {
+			if (typeof m.to !== "string" || !CODE.test(m.to) || m.to === at.u) return;
+			if (typeof m.k !== "string" || !/^[a-z]{1,6}$/.test(m.k)) return;
+			const v = nums(m.v === undefined ? [] : m.v);
+			const s = m.s === undefined ? "" : m.s;
+			if (!v || typeof s !== "string" || !NOTE.test(s)) return;
+			const text = JSON.stringify({ t: "d", from: at.u, n: at.nm, c: at.c, l: at.l, w: at.at, k: m.k, v, s });
+			let sent = 0;
+			for (const o of this.ctx.getWebSockets()) {
+				const a = o.deserializeAttachment();
+				if (!a || a.u !== m.to || o === ws) continue;
+				try {
+					o.send(text);
+					sent++;
+				} catch (e) {
+					// that connection is closing
+				}
+			}
+			if (!sent) {
+				try {
+					ws.send(JSON.stringify({ t: "nf", to: m.to, k: m.k }));
+				} catch (e) {
+					// closing
+				}
+			}
+		}
 	}
 
 	async webSocketClose(ws, code, reason, wasClean) {
@@ -116,10 +211,10 @@ export class MyDurableObject extends DurableObject {
 		this.left(ws);
 	}
 
-	// 나간 사람을 다른 사람들에게 알린다
+	// 나간 사람을 다른 사람들에게 알린다 (로비는 알리지 않는다 — 친구 목록은 물어볼 때 다시 확인한다)
 	left(ws) {
 		const at = ws.deserializeAttachment();
-		if (at) this.tell(at.id, JSON.stringify({ t: "bye", id: at.id }));
+		if (at && !at.lobby) this.tell(at.id, JSON.stringify({ t: "bye", id: at.id }));
 	}
 
 	// 보낸 사람(번호 from)을 뺀 방 안의 모두에게 보낸다
@@ -139,11 +234,11 @@ export class MyDurableObject extends DurableObject {
 export default {
 	async fetch(request, env) {
 		const url = new URL(request.url);
-		const m = /^\/ws\/train-([1-9])$/.exec(url.pathname);
-		if (!m) return new Response("pixel rpg room server: ok (v2)", { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
+		const m = /^\/ws\/(train-[1-9]|lobby)$/.exec(url.pathname);
+		if (!m) return new Response("pixel rpg room server: ok (v4)", { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
 		if ((request.headers.get("Upgrade") || "").toLowerCase() !== "websocket") return new Response("websocket only", { status: 426 });
 		const ns = Object.values(env).find((v) => v && typeof v.idFromName === "function"); // the Durable Object binding, whatever it is called
 		if (!ns) return new Response("no durable object binding", { status: 500 });
-		return ns.get(ns.idFromName("train-" + m[1])).fetch(request);
+		return ns.get(ns.idFromName(m[1])).fetch(request);
 	},
 };
