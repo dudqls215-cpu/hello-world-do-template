@@ -1,16 +1,20 @@
 // @ts-nocheck
-// 픽셀 RPG 방 서버 v4 — Cloudflare Workers + Durable Objects (무료 플랜)
+// 픽셀 RPG 방 서버 v5 — Cloudflare Workers + Durable Objects (무료 플랜)
 // 훈련장 방 하나가 Durable Object 하나다. 접속한 사람이 보낸 "내 상태"(위치·방향·직업·동작)를 같은 방의 다른 사람에게 전달만 한다.
 // 상태 말고 "작은 사건"(예: 적이 공격을 시작함, 허수아비가 맞음)도 전달한다: 이름 하나 + 숫자 몇 개. 무슨 뜻인지는 게임이 정하고, 서버는 모양만 검사한다.
 // (v4) 닉네임: 방 안에서 "내 이름과 번호"를 알리면 기억했다가 새로 온 사람에게도 알려 준다.
 // (v4) 로비: 방과 따로, 모든 사람이 한 곳(lobby)에 접속해 "나는 누구이고 어디 있다"를 알린다. 친구가 지금 접속해 있는지, 어디 있는지 묻고,
 //      번호를 아는 사람에게 짧은 쪽지(친구 신청·파티 신청·파티 체력)를 보낸다. 로비도 같은 Durable Object 종류를 쓰므로 Cloudflare 설정은 그대로다.
+// (v5) 유령 정리: 앱을 갑자기 끄면 연결이 끊긴 것을 서버가 모를 수 있다. 접속마다 '마지막으로 소식이 온 때'를 기억하고(메시지 + 자동 응답한 "p"),
+//      방은 30초·로비는 70초 동안 소식이 없는 연결을 닫고 방 사람들에게 나갔다고 알린다. 새 사람이 들어올 때와 메시지가 올 때(5초에 한 번) 확인한다.
 // 주소: wss://<서버 주소>/ws/train-1 … train-9 · wss://<서버 주소>/ws/lobby   ·   https://<서버 주소>/ 를 열면 "ok" 가 보인다.
 import { DurableObject } from "cloudflare:workers";
 
 const CAP = 12; // 방 하나에 들어갈 수 있는 사람 수. 꽉 차면 닫힘 코드 4001 로 돌려보내고, 게임이 다음 방을 찾는다
 const LOBBY_CAP = 400; // 로비에 동시에 접속할 수 있는 사람 수
 const MAX_LEN = 160; // 받는 메시지의 최대 길이(글자)
+const STALE = 30000; // (v5) 방: 이만큼(ms) 소식이 없으면 유령으로 보고 닫는다 (게임은 6초마다 상태를 다시 보낸다)
+const LOBBY_STALE = 70000; // (v5) 로비: 게임이 25초마다 "p" 를 보낸다
 const MAX_RATE = 30; // 한 사람이 1초에 보낼 수 있는 메시지 수. 넘는 것은 버린다
 const CLASS = /^[a-z]{2}$/; // 직업 이름은 영문 소문자 두 글자면 받는다. 어떤 직업이 있는지는 게임이 안다 — 직업이 늘어도 서버를 바꿀 필요가 없다
 const CODE = /^[a-z0-9]{8}$/; // (v4) 사람 번호: 게임이 기기마다 한 번 만든 영문 소문자·숫자 8자
@@ -70,7 +74,8 @@ export class MyDurableObject extends DurableObject {
 		const lobby = new URL(request.url).pathname === "/ws/lobby";
 		const pair = new WebSocketPair();
 		const client = pair[0], server = pair[1];
-		const here = this.ctx.getWebSockets();
+		this.sweep(true); // (v5) 들어오기 전에 유령부터 정리 — 새 사람이 받는 명단에 유령이 없게
+		const here = this.ctx.getWebSockets().filter((o) => !this.gone.has(o));
 		if (here.length >= (lobby ? LOBBY_CAP : CAP)) {
 			server.accept();
 			server.close(4001, "full");
@@ -78,7 +83,7 @@ export class MyDurableObject extends DurableObject {
 		}
 		this.ctx.acceptWebSocket(server); // 쉬는 동안에는 요금이 붙지 않는 방식(Hibernation)
 		const id = 1 + Math.floor(Math.random() * 2147483646);
-		server.serializeAttachment({ id, s: null, w: 0, n: 0, lobby, u: null, nm: null, c: null, l: 0, at: null });
+		server.serializeAttachment({ id, s: null, w: 0, n: 0, lobby, u: null, nm: null, c: null, l: 0, at: null, lt: Date.now() });
 		if (lobby) {
 			server.send(JSON.stringify({ t: "hi", id, lobby: 1 }));
 			return new Response(null, { status: 101, webSocket: client });
@@ -86,25 +91,28 @@ export class MyDurableObject extends DurableObject {
 		const who = [];
 		for (const ws of here) {
 			const a = ws.deserializeAttachment();
-			if (a && a.s) who.push(a.u ? [a.id, a.s, a.nm, a.u] : [a.id, a.s]);
+			if (a && a.s && !a.lobby) who.push(a.u ? [a.id, a.s, a.nm, a.u] : [a.id, a.s]);
 		}
-		server.send(JSON.stringify({ t: "hi", id, cap: CAP, who, v: 4 }));
+		server.send(JSON.stringify({ t: "hi", id, cap: CAP, who, v: 5 }));
 		return new Response(null, { status: 101, webSocket: client });
 	}
 
 	// 누군가의 상태나 사건이 왔다: 검사하고, (상태는) 기억해 두고, 같은 방의 다른 사람들에게 전달
 	async webSocketMessage(ws, message) {
 		if (typeof message !== "string" || message.length > MAX_LEN) return;
+		const at = ws.deserializeAttachment();
+		if (!at) return;
+		at.lt = Date.now(); // (v5) 마지막으로 소식이 온 때
 		if (message === "p") {
+			ws.serializeAttachment(at);
 			try {
 				ws.send("o");
 			} catch (e) {
 				// closing
 			}
+			this.sweep(false);
 			return;
 		}
-		const at = ws.deserializeAttachment();
-		if (!at) return;
 		const sec = Math.floor(Date.now() / 1000);
 		if (at.w !== sec) {
 			at.w = sec;
@@ -119,6 +127,7 @@ export class MyDurableObject extends DurableObject {
 				m = null;
 			}
 		}
+		this.sweep(false);
 		if (at.lobby) {
 			this.lobbyMessage(ws, at, m);
 			return;
@@ -211,6 +220,35 @@ export class MyDurableObject extends DurableObject {
 		this.left(ws);
 	}
 
+	// (v5) 소식이 끊긴 연결(유령)을 닫고 나갔다고 알린다. now: 새 사람이 들어올 때는 바로, 메시지가 올 때는 5초에 한 번만
+	sweep(now) {
+		if (!this.gone) this.gone = new Set();
+		const t = Date.now();
+		if (!now && this.swept && t - this.swept < 5000) return;
+		this.swept = t;
+		for (const o of this.ctx.getWebSockets()) {
+			if (this.gone.has(o)) continue;
+			const a = o.deserializeAttachment();
+			if (!a) continue;
+			let last = a.lt || 0;
+			try {
+				const r = this.ctx.getWebSocketAutoResponseTimestamp(o); // 방을 깨우지 않고 답한 "p" 의 시각
+				if (r) last = Math.max(last, r.getTime());
+			} catch (e) {
+				// not available here
+			}
+			if (last && t - last > (a.lobby ? LOBBY_STALE : STALE)) {
+				this.gone.add(o);
+				try {
+					o.close(4002, "stale");
+				} catch (e) {
+					// already closed
+				}
+				this.left(o);
+			}
+		}
+	}
+
 	// 나간 사람을 다른 사람들에게 알린다 (로비는 알리지 않는다 — 친구 목록은 물어볼 때 다시 확인한다)
 	left(ws) {
 		const at = ws.deserializeAttachment();
@@ -220,6 +258,7 @@ export class MyDurableObject extends DurableObject {
 	// 보낸 사람(번호 from)을 뺀 방 안의 모두에게 보낸다
 	tell(from, text) {
 		for (const o of this.ctx.getWebSockets()) {
+			if (this.gone && this.gone.has(o)) continue;
 			const a = o.deserializeAttachment();
 			if (!a || a.id === from) continue;
 			try {
@@ -235,7 +274,7 @@ export default {
 	async fetch(request, env) {
 		const url = new URL(request.url);
 		const m = /^\/ws\/(train-[1-9]|lobby)$/.exec(url.pathname);
-		if (!m) return new Response("pixel rpg room server: ok (v4)", { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
+		if (!m) return new Response("pixel rpg room server: ok (v5)", { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
 		if ((request.headers.get("Upgrade") || "").toLowerCase() !== "websocket") return new Response("websocket only", { status: 426 });
 		const ns = Object.values(env).find((v) => v && typeof v.idFromName === "function"); // the Durable Object binding, whatever it is called
 		if (!ns) return new Response("no durable object binding", { status: 500 });
