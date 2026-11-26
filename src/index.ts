@@ -1,5 +1,5 @@
 // @ts-nocheck
-// 픽셀 RPG 방 서버 v5 — Cloudflare Workers + Durable Objects (무료 플랜)
+// 픽셀 RPG 방 서버 v6 — Cloudflare Workers + Durable Objects (무료 플랜)
 // 훈련장 방 하나가 Durable Object 하나다. 접속한 사람이 보낸 "내 상태"(위치·방향·직업·동작)를 같은 방의 다른 사람에게 전달만 한다.
 // 상태 말고 "작은 사건"(예: 적이 공격을 시작함, 허수아비가 맞음)도 전달한다: 이름 하나 + 숫자 몇 개. 무슨 뜻인지는 게임이 정하고, 서버는 모양만 검사한다.
 // (v4) 닉네임: 방 안에서 "내 이름과 번호"를 알리면 기억했다가 새로 온 사람에게도 알려 준다.
@@ -7,6 +7,9 @@
 //      번호를 아는 사람에게 짧은 쪽지(친구 신청·파티 신청·파티 체력)를 보낸다. 로비도 같은 Durable Object 종류를 쓰므로 Cloudflare 설정은 그대로다.
 // (v5) 유령 정리: 앱을 갑자기 끄면 연결이 끊긴 것을 서버가 모를 수 있다. 접속마다 '마지막으로 소식이 온 때'를 기억하고(메시지 + 자동 응답한 "p"),
 //      방은 30초·로비는 70초 동안 소식이 없는 연결을 닫고 방 사람들에게 나갔다고 알린다. 새 사람이 들어올 때와 메시지가 올 때(5초에 한 번) 확인한다.
+// (v6) 채팅: { t: "c", s: 글 } — 40자까지, 한 사람이 0.8초에 하나. 같은 방 사람들에게 { t: "c", id, s } 로 전달만 한다(기억하지 않는다).
+// (v6) 방 위치: 방(Durable Object)은 처음 만들어질 때 자리가 정해지고 옮겨지지 않는다. 방 이름 앞에 "v6-"을 붙여 새로 만들고,
+//      처음 만들 때 아시아(apac)에 두라고 알려 준다. https://<서버 주소>/where 를 열면 방이 있는 데이터센터(colo)가 보인다.
 // 주소: wss://<서버 주소>/ws/train-1 … train-9 · wss://<서버 주소>/ws/lobby   ·   https://<서버 주소>/ 를 열면 "ok" 가 보인다.
 import { DurableObject } from "cloudflare:workers";
 
@@ -16,6 +19,10 @@ const MAX_LEN = 160; // 받는 메시지의 최대 길이(글자)
 const STALE = 30000; // (v5) 방: 이만큼(ms) 소식이 없으면 유령으로 보고 닫는다 (게임은 6초마다 상태를 다시 보낸다)
 const LOBBY_STALE = 70000; // (v5) 로비: 게임이 25초마다 "p" 를 보낸다
 const MAX_RATE = 30; // 한 사람이 1초에 보낼 수 있는 메시지 수. 넘는 것은 버린다
+const CHAT_MAX = 40; // (v6) 채팅 글자 수
+const CHAT_GAP = 800; // (v6) 한 사람의 채팅 사이 최소 간격(ms)
+const ROOMS = "v6-"; // (v6) 방 이름 앞에 붙는 말: 바꾸면 방이 새로 만들어진다
+const PLACE = "apac"; // (v6) 새 방을 둘 곳: 아시아·태평양
 const CLASS = /^[a-z]{2}$/; // 직업 이름은 영문 소문자 두 글자면 받는다. 어떤 직업이 있는지는 게임이 안다 — 직업이 늘어도 서버를 바꿀 필요가 없다
 const CODE = /^[a-z0-9]{8}$/; // (v4) 사람 번호: 게임이 기기마다 한 번 만든 영문 소문자·숫자 8자
 const NAME = /^[가-힣a-zA-Z0-9]{1,12}$/; // (v4) 닉네임: 한글·영문·숫자 12자까지
@@ -51,6 +58,14 @@ function cleanEvent(m) {
 	return v ? { k: m.k, v } : null;
 }
 
+// (v6) 채팅: 글자만 남기고(제어 문자 없앰, 공백 하나로) 1~40자면 그 글, 아니면 null
+function cleanChat(m) {
+	if (!m || typeof m !== "object" || m.t !== "c" || typeof m.s !== "string") return null;
+	const s = m.s.replace(/[\u0000-\u001f\u007f\u2028\u2029]/g, "").replace(/\s+/g, " ").trim();
+	const n = [...s].length;
+	return n >= 1 && n <= CHAT_MAX ? s : null;
+}
+
 // (v4) 방 안에서 내 이름: { t: "n", u: 번호, n: 닉네임 }. 이상하면 null
 function cleanName(m) {
 	if (!m || typeof m !== "object" || m.t !== "n") return null;
@@ -71,6 +86,16 @@ export class MyDurableObject extends DurableObject {
 
 	// 새 접속. 방이 차 있으면 4001 로 닫는다. 아니면 번호를 주고, 지금 방에 있는 사람들의 마지막 상태(와 이름)를 알려 준다
 	async fetch(request) {
+		if (new URL(request.url).pathname === "/where") { // (v6) 이 방이 있는 데이터센터
+			let colo = "?";
+			try {
+				const t = await (await fetch("https://cloudflare.com/cdn-cgi/trace")).text();
+				colo = (/colo=([A-Z]+)/.exec(t) || [])[1] || "?";
+			} catch (e) {
+				// no way out from here
+			}
+			return new Response("room colo=" + colo + " (v6, " + PLACE + ")", { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
+		}
 		const lobby = new URL(request.url).pathname === "/ws/lobby";
 		const pair = new WebSocketPair();
 		const client = pair[0], server = pair[1];
@@ -93,7 +118,7 @@ export class MyDurableObject extends DurableObject {
 			const a = ws.deserializeAttachment();
 			if (a && a.s && !a.lobby) who.push(a.u ? [a.id, a.s, a.nm, a.u] : [a.id, a.s]);
 		}
-		server.send(JSON.stringify({ t: "hi", id, cap: CAP, who, v: 5 }));
+		server.send(JSON.stringify({ t: "hi", id, cap: CAP, who, v: 6 }));
 		return new Response(null, { status: 101, webSocket: client });
 	}
 
@@ -130,6 +155,18 @@ export class MyDurableObject extends DurableObject {
 		this.sweep(false);
 		if (at.lobby) {
 			this.lobbyMessage(ws, at, m);
+			return;
+		}
+		const ch = cleanChat(m);
+		if (ch) { // (v6) 채팅: 너무 잦으면 버린다
+			const now = Date.now();
+			if (now - (at.ct || 0) < CHAT_GAP) {
+				ws.serializeAttachment(at);
+				return;
+			}
+			at.ct = now;
+			ws.serializeAttachment(at);
+			this.tell(at.id, JSON.stringify({ t: "c", id: at.id, s: ch }));
 			return;
 		}
 		const s = clean(m), ev = s ? null : cleanEvent(m), nm = s || ev ? null : cleanName(m);
@@ -273,11 +310,12 @@ export class MyDurableObject extends DurableObject {
 export default {
 	async fetch(request, env) {
 		const url = new URL(request.url);
-		const m = /^\/ws\/(train-[1-9]|lobby)$/.exec(url.pathname);
-		if (!m) return new Response("pixel rpg room server: ok (v5)", { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
-		if ((request.headers.get("Upgrade") || "").toLowerCase() !== "websocket") return new Response("websocket only", { status: 426 });
 		const ns = Object.values(env).find((v) => v && typeof v.idFromName === "function"); // the Durable Object binding, whatever it is called
+		if (url.pathname === "/where" && ns) return ns.get(ns.idFromName(ROOMS + "train-1"), { locationHint: PLACE }).fetch(request); // (v6) 방 1이 어디 있나
+		const m = /^\/ws\/(train-[1-9]|lobby)$/.exec(url.pathname);
+		if (!m) return new Response("pixel rpg room server: ok (v6) · edge " + ((request.cf && request.cf.colo) || "?"), { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
+		if ((request.headers.get("Upgrade") || "").toLowerCase() !== "websocket") return new Response("websocket only", { status: 426 });
 		if (!ns) return new Response("no durable object binding", { status: 500 });
-		return ns.get(ns.idFromName(m[1])).fetch(request);
+		return ns.get(ns.idFromName(ROOMS + m[1]), { locationHint: PLACE }).fetch(request); // (v6) 새 이름의 방, 처음 만들 땐 아시아에
 	},
 };
