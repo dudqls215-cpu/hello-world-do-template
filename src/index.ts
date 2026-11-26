@@ -8,8 +8,9 @@
 // (v5) 유령 정리: 앱을 갑자기 끄면 연결이 끊긴 것을 서버가 모를 수 있다. 접속마다 '마지막으로 소식이 온 때'를 기억하고(메시지 + 자동 응답한 "p"),
 //      방은 30초·로비는 70초 동안 소식이 없는 연결을 닫고 방 사람들에게 나갔다고 알린다. 새 사람이 들어올 때와 메시지가 올 때(5초에 한 번) 확인한다.
 // (v6) 채팅: { t: "c", s: 글 } — 40자까지, 한 사람이 0.8초에 하나. 같은 방 사람들에게 { t: "c", id, s } 로 전달만 한다(기억하지 않는다).
-// (v6) 방 위치: 방(Durable Object)은 처음 만들어질 때 자리가 정해지고 옮겨지지 않는다. 방 이름 앞에 "v6-"을 붙여 새로 만들고,
-//      처음 만들 때 아시아(apac)에 두라고 알려 준다. https://<서버 주소>/where 를 열면 방이 있는 데이터센터(colo)가 보인다.
+// (v6) 방 위치: 방(Durable Object)은 처음 만들어질 때 자리가 정해지고 옮겨지지 않는다. https://<서버 주소>/where 를 열면 방이 있는 데이터센터(colo)가 보인다.
+// (v6.1) 'apac'로 지정했더니 싱가포르(SIN)에 생겼다. 지정을 빼고 이름을 "v7-"로 바꿔 다시 만든다: 지정이 없으면 방은 처음 부른 곳 근처에 생긴다.
+//      서버를 올린 뒤 한국에서 https://<서버 주소>/where?all 을 열면 방 1~9와 로비를 모두 한국 근처에 만들고 위치를 보여 준다.
 // 주소: wss://<서버 주소>/ws/train-1 … train-9 · wss://<서버 주소>/ws/lobby   ·   https://<서버 주소>/ 를 열면 "ok" 가 보인다.
 import { DurableObject } from "cloudflare:workers";
 
@@ -21,8 +22,7 @@ const LOBBY_STALE = 70000; // (v5) 로비: 게임이 25초마다 "p" 를 보낸�
 const MAX_RATE = 30; // 한 사람이 1초에 보낼 수 있는 메시지 수. 넘는 것은 버린다
 const CHAT_MAX = 40; // (v6) 채팅 글자 수
 const CHAT_GAP = 800; // (v6) 한 사람의 채팅 사이 최소 간격(ms)
-const ROOMS = "v6-"; // (v6) 방 이름 앞에 붙는 말: 바꾸면 방이 새로 만들어진다
-const PLACE = "apac"; // (v6) 새 방을 둘 곳: 아시아·태평양
+const ROOMS = "v7-"; // (v6.1) 방 이름 앞에 붙는 말: 바꾸면 방이 새로 만들어진다 (v6-: 싱가포르에 생김)
 const CLASS = /^[a-z]{2}$/; // 직업 이름은 영문 소문자 두 글자면 받는다. 어떤 직업이 있는지는 게임이 안다 — 직업이 늘어도 서버를 바꿀 필요가 없다
 const CODE = /^[a-z0-9]{8}$/; // (v4) 사람 번호: 게임이 기기마다 한 번 만든 영문 소문자·숫자 8자
 const NAME = /^[가-힣a-zA-Z0-9]{1,12}$/; // (v4) 닉네임: 한글·영문·숫자 12자까지
@@ -94,7 +94,7 @@ export class MyDurableObject extends DurableObject {
 			} catch (e) {
 				// no way out from here
 			}
-			return new Response("room colo=" + colo + " (v6, " + PLACE + ")", { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
+			return new Response("room colo=" + colo, { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
 		}
 		const lobby = new URL(request.url).pathname === "/ws/lobby";
 		const pair = new WebSocketPair();
@@ -311,11 +311,22 @@ export default {
 	async fetch(request, env) {
 		const url = new URL(request.url);
 		const ns = Object.values(env).find((v) => v && typeof v.idFromName === "function"); // the Durable Object binding, whatever it is called
-		if (url.pathname === "/where" && ns) return ns.get(ns.idFromName(ROOMS + "train-1"), { locationHint: PLACE }).fetch(request); // (v6) 방 1이 어디 있나
+		if (url.pathname === "/where" && ns) { // (v6.1) 방 1이 어디 있나 (?all: 방 1~9와 로비를 모두 — 없으면 여기 근처에 만든다)
+			const names = url.searchParams.has("all") ? ["train-1", "train-2", "train-3", "train-4", "train-5", "train-6", "train-7", "train-8", "train-9", "lobby"] : ["train-1"];
+			const out = [];
+			for (const n of names) {
+				try {
+					out.push(n + ": " + (await (await ns.get(ns.idFromName(ROOMS + n)).fetch(new Request("https://room/where"))).text()));
+				} catch (e) {
+					out.push(n + ": ?");
+				}
+			}
+			return new Response(out.join("\n") + "\n(v6.1 · 이 요청이 들어온 곳 " + ((request.cf && request.cf.colo) || "?") + ")", { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
+		}
 		const m = /^\/ws\/(train-[1-9]|lobby)$/.exec(url.pathname);
-		if (!m) return new Response("pixel rpg room server: ok (v6) · edge " + ((request.cf && request.cf.colo) || "?"), { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
+		if (!m) return new Response("pixel rpg room server: ok (v6.1) · edge " + ((request.cf && request.cf.colo) || "?"), { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
 		if ((request.headers.get("Upgrade") || "").toLowerCase() !== "websocket") return new Response("websocket only", { status: 426 });
 		if (!ns) return new Response("no durable object binding", { status: 500 });
-		return ns.get(ns.idFromName(ROOMS + m[1]), { locationHint: PLACE }).fetch(request); // (v6) 새 이름의 방, 처음 만들 땐 아시아에
+		return ns.get(ns.idFromName(ROOMS + m[1])).fetch(request); // (v6.1) 새 이름의 방: 처음 부른 곳 근처에 생긴다
 	},
 };
