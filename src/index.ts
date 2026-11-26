@@ -11,6 +11,7 @@
 // (v6) 방 위치: 방(Durable Object)은 처음 만들어질 때 자리가 정해지고 옮겨지지 않는다. https://<서버 주소>/where 를 열면 방이 있는 데이터센터(colo)가 보인다.
 // (v6.1) 'apac'로 지정했더니 싱가포르(SIN)에 생겼다. 지정을 빼고 이름을 "v7-"로 바꿔 다시 만든다: 지정이 없으면 방은 처음 부른 곳 근처에 생긴다.
 //      서버를 올린 뒤 한국에서 https://<서버 주소>/where?all 을 열면 방 1~9와 로비를 모두 한국 근처에 만들고 위치를 보여 준다.
+// (v6.2) 지정 없이도 싱가포르였다. 2026년 6월에 생긴 'apac-ne'(동북아시아) 지정으로 "v8-" 방을 새로 만든다.
 // 주소: wss://<서버 주소>/ws/train-1 … train-9 · wss://<서버 주소>/ws/lobby   ·   https://<서버 주소>/ 를 열면 "ok" 가 보인다.
 import { DurableObject } from "cloudflare:workers";
 
@@ -22,7 +23,8 @@ const LOBBY_STALE = 70000; // (v5) 로비: 게임이 25초마다 "p" 를 보낸�
 const MAX_RATE = 30; // 한 사람이 1초에 보낼 수 있는 메시지 수. 넘는 것은 버린다
 const CHAT_MAX = 40; // (v6) 채팅 글자 수
 const CHAT_GAP = 800; // (v6) 한 사람의 채팅 사이 최소 간격(ms)
-const ROOMS = "v7-"; // (v6.1) 방 이름 앞에 붙는 말: 바꾸면 방이 새로 만들어진다 (v6-: 싱가포르에 생김)
+const ROOMS = "v8-"; // (v6.2) 방 이름 앞에 붙는 말: 바꾸면 방이 새로 만들어진다 (v6-: apac 지정 → 싱가포르, v7-: 지정 없이 → 역시 싱가포르)
+const PLACE = "apac-ne"; // (v6.2) 새 방을 둘 곳: 동북아시아(일본·한국). 2026년 6월에 생긴 좁은 지정 — 최선을 다할 뿐 보장은 아니다
 const CLASS = /^[a-z]{2}$/; // 직업 이름은 영문 소문자 두 글자면 받는다. 어떤 직업이 있는지는 게임이 안다 — 직업이 늘어도 서버를 바꿀 필요가 없다
 const CODE = /^[a-z0-9]{8}$/; // (v4) 사람 번호: 게임이 기기마다 한 번 만든 영문 소문자·숫자 8자
 const NAME = /^[가-힣a-zA-Z0-9]{1,12}$/; // (v4) 닉네임: 한글·영문·숫자 12자까지
@@ -316,17 +318,17 @@ export default {
 			const out = [];
 			for (const n of names) {
 				try {
-					out.push(n + ": " + (await (await ns.get(ns.idFromName(ROOMS + n)).fetch(new Request("https://room/where"))).text()));
+					out.push(n + ": " + (await (await ns.get(ns.idFromName(ROOMS + n), { locationHint: PLACE }).fetch(new Request("https://room/where"))).text()));
 				} catch (e) {
 					out.push(n + ": ?");
 				}
 			}
-			return new Response(out.join("\n") + "\n(v6.1 · 이 요청이 들어온 곳 " + ((request.cf && request.cf.colo) || "?") + ")", { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
+			return new Response(out.join("\n") + "\n(v6.2 · " + PLACE + " · 이 요청이 들어온 곳 " + ((request.cf && request.cf.colo) || "?") + ")", { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
 		}
 		const m = /^\/ws\/(train-[1-9]|lobby)$/.exec(url.pathname);
-		if (!m) return new Response("pixel rpg room server: ok (v6.1) · edge " + ((request.cf && request.cf.colo) || "?"), { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
+		if (!m) return new Response("pixel rpg room server: ok (v6.2) · edge " + ((request.cf && request.cf.colo) || "?"), { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
 		if ((request.headers.get("Upgrade") || "").toLowerCase() !== "websocket") return new Response("websocket only", { status: 426 });
 		if (!ns) return new Response("no durable object binding", { status: 500 });
-		return ns.get(ns.idFromName(ROOMS + m[1])).fetch(request); // (v6.1) 새 이름의 방: 처음 부른 곳 근처에 생긴다
+		return ns.get(ns.idFromName(ROOMS + m[1]), { locationHint: PLACE }).fetch(request); // (v6.2) 새 이름의 방: 처음 만들 땐 동북아시아에
 	},
 };
