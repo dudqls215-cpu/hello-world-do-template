@@ -12,6 +12,7 @@
 // (v6.1) 'apac'로 지정했더니 싱가포르(SIN)에 생겼다. 지정을 빼고 이름을 "v7-"로 바꿔 다시 만든다: 지정이 없으면 방은 처음 부른 곳 근처에 생긴다.
 //      서버를 올린 뒤 한국에서 https://<서버 주소>/where?all 을 열면 방 1~9와 로비를 모두 한국 근처에 만들고 위치를 보여 준다.
 // (v6.2) 지정 없이도 싱가포르였다. 2026년 6월에 생긴 'apac-ne'(동북아시아) 지정으로 "v8-" 방을 새로 만든다.
+// (v6.3) 상태 메시지에 높이 y(0~400)를 같이 전한다: 8방향 대쉬로 공중에 떠 있는 모습이 다른 사람 화면에도 보이게.
 // 주소: wss://<서버 주소>/ws/train-1 … train-9 · wss://<서버 주소>/ws/lobby   ·   https://<서버 주소>/ 를 열면 "ok" 가 보인다.
 import { DurableObject } from "cloudflare:workers";
 
@@ -38,7 +39,10 @@ function clean(m) {
 	if (!Number.isFinite(x) || !Number.isFinite(q)) return null;
 	if (typeof m.c !== "string" || !CLASS.test(m.c)) return null;
 	if (typeof m.a !== "string" || !/^[a-z0-9]{1,12}$/.test(m.a)) return null;
-	return { x: Math.round(Math.max(0, Math.min(640, x)) * 10) / 10, f: m.f < 0 ? -1 : 1, c: m.c, a: m.a, q: Math.max(0, Math.min(65535, Math.floor(q))), g: m.g ? 1 : 0 };
+	const o = { x: Math.round(Math.max(0, Math.min(640, x)) * 10) / 10, f: m.f < 0 ? -1 : 1, c: m.c, a: m.a, q: Math.max(0, Math.min(65535, Math.floor(q))), g: m.g ? 1 : 0 };
+	const y = Number(m.y); // (v6.3) 높이: 공중 대쉬(위·아래·대각선)를 다른 사람 화면에도
+	if (m.y !== undefined && Number.isFinite(y)) o.y = Math.round(Math.max(0, Math.min(400, y)));
+	return o;
 }
 
 // 숫자 목록: 6개 이하, 각각 ±100000 안, 소수 한 자리. 이상하면 null
@@ -178,7 +182,7 @@ export class MyDurableObject extends DurableObject {
 			at.nm = nm.n;
 		}
 		ws.serializeAttachment(at);
-		if (s) this.tell(at.id, JSON.stringify({ t: "s", id: at.id, x: s.x, f: s.f, c: s.c, a: s.a, q: s.q, g: s.g }));
+		if (s) this.tell(at.id, JSON.stringify({ t: "s", id: at.id, ...s })); // (v6.3) 정리된 그대로(높이 y 포함)
 		else if (ev) this.tell(at.id, JSON.stringify({ t: "e", id: at.id, k: ev.k, v: ev.v })); // 사건은 기억하지 않고 전달만 한다
 		else if (nm) this.tell(at.id, JSON.stringify({ t: "n", id: at.id, u: nm.u, n: nm.n }));
 	}
@@ -323,10 +327,10 @@ export default {
 					out.push(n + ": ?");
 				}
 			}
-			return new Response(out.join("\n") + "\n(v6.2 · " + PLACE + " · 이 요청이 들어온 곳 " + ((request.cf && request.cf.colo) || "?") + ")", { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
+			return new Response(out.join("\n") + "\n(v6.3 · " + PLACE + " · 이 요청이 들어온 곳 " + ((request.cf && request.cf.colo) || "?") + ")", { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
 		}
 		const m = /^\/ws\/(train-[1-9]|lobby)$/.exec(url.pathname);
-		if (!m) return new Response("pixel rpg room server: ok (v6.2) · edge " + ((request.cf && request.cf.colo) || "?"), { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
+		if (!m) return new Response("pixel rpg room server: ok (v6.3) · edge " + ((request.cf && request.cf.colo) || "?"), { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
 		if ((request.headers.get("Upgrade") || "").toLowerCase() !== "websocket") return new Response("websocket only", { status: 426 });
 		if (!ns) return new Response("no durable object binding", { status: 500 });
 		return ns.get(ns.idFromName(ROOMS + m[1]), { locationHint: PLACE }).fetch(request); // (v6.2) 새 이름의 방: 처음 만들 땐 동북아시아에
