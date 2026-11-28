@@ -1,5 +1,10 @@
 // @ts-nocheck
-// 픽셀 RPG 방 서버 v9 — Cloudflare Workers + Durable Objects (무료 플랜)
+// 픽셀 RPG 방 서버 v10 — Cloudflare Workers + Durable Objects (무료 플랜)
+// (v10) 관리자: https://<서버 주소>/admin 을 열면 관리자 화면. 관리자 키(Cloudflare 비밀 값 ADMIN_KEY)를 넣고
+//      · 아이디 목록 보기 (아이디 · 마지막 저장 시각 · 로그인된 기기 수)
+//      · 임시 비밀번호 발급 — 비밀번호를 잊은 플레이어용. 그 계정에 로그인돼 있던 기기는 모두 로그아웃되고, 캐릭터 저장은 그대로 남는다.
+//      관리자 키를 5번 틀리면 관리자 기능 전체가 10분 쉰다. ADMIN_KEY 가 없거나 12자보다 짧으면 관리자 기능은 꺼져 있다.
+//      게임이 읽는 버전 표시(첫 화면의 "(v9)", 접속 인사말의 v: 9)는 그대로 둔다 — 게임은 바뀐 것이 없다.
 // (v9) 계정: POST https://<서버 주소>/acct/signup · login · load · save · logout (본문은 JSON 글). 아이디(영문 소문자·숫자 4~12자)와 비밀번호(4~32자).
 //      비밀번호는 저장하지 않는다 — 소금(salt)을 섞어 여러 번 해시한 값만 둔다. 로그인하면 열쇠(tok)를 주고, 그 뒤로는 열쇠로 저장을 읽고 쓴다(기기 5대까지).
 //      저장은 글 한 덩어리(6만 자까지)와 판 번호(rev). 내가 아는 판 번호가 서버와 다르면(다른 기기가 먼저 저장) 덮어쓰지 않고 서버의 것을 돌려준다.
@@ -42,6 +47,9 @@ const NAME = /^[가-힣a-zA-Z0-9]{1,12}$/; // (v4) 닉네임: 한글·영문·�
 const WHERE = /^[a-z]{1,8}-[1-9]$/; // (v4) 어디 있는지: 장소 이름-방 번호 (예: lab-3)
 const ACCT_ID = /^[a-z0-9]{4,12}$/; // (v9) 계정 아이디
 const ACCT_MAX = 60000; // (v9) 저장 한 덩어리의 최대 길이(글자)
+const ADMIN_FAILS = 5; // (v10) 관리자 키를 이만큼 틀리면
+const ADMIN_LOCK = 600000; // (v10) 이만큼(ms) 관리자 기능을 쉰다
+const TEMP_CH = "abcdefghjkmnpqrstuvwxyz23456789"; // (v10) 임시 비밀번호 글자 (헷갈리는 i l o 0 1 뺌)
 const ACCT_ITER = 2000; // (v9) 비밀번호 해시 반복 수 (무료 플랜의 요청당 계산 시간 안에서)
 const CORS = { "content-type": "application/json; charset=utf-8", "access-control-allow-origin": "*", "access-control-allow-methods": "POST, OPTIONS", "access-control-allow-headers": "content-type", "cache-control": "no-store" };
 const J = (o, status) => new Response(JSON.stringify(o), { status: status || 200, headers: CORS });
@@ -53,6 +61,16 @@ async function sha(t) {
 async function pwHash(pw, salt) {
 	const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(pw), "PBKDF2", false, ["deriveBits"]);
 	return hex(await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt: new TextEncoder().encode(salt), iterations: ACCT_ITER }, key, 256));
+}
+// (v10) 임시 비밀번호 8자
+function tempPw() {
+	let out = "";
+	while (out.length < 8) {
+		for (const b of crypto.getRandomValues(new Uint8Array(16))) {
+			if (b < 248 && out.length < 8) out += TEMP_CH[b % TEMP_CH.length]; // 248 = 31×8: 고르게 나오게
+		}
+	}
+	return out;
 }
 const NOTE = /^[a-z0-9,]{0,60}$/; // (v4) 쪽지에 붙는 짧은 글(파티원 번호 목록 등)
 
@@ -112,6 +130,57 @@ export class MyDurableObject extends DurableObject {
 		} catch (e) {
 			// not available here: answered by hand below
 		}
+	}
+
+	// (v10) 관리자 — 바깥에서는 부를 수 없고, 아래 export default 가 키를 확인한 뒤에만 부른다
+	//   /admin-gate  (관리자 문지기 방) 키 확인 + 틀린 횟수 세기
+	//   /admin-list  (계정 방) 이 방에 있는 아이디들
+	//   /admin-reset (계정 방) 임시 비밀번호로 바꾸고 로그인된 기기 모두 로그아웃
+	async admin(request, path) {
+		let m = null;
+		try {
+			m = JSON.parse(await request.text());
+		} catch (e) {
+			m = null;
+		}
+		if (!m || typeof m !== "object") return J({ ok: 0, e: "bad" });
+		const st = this.ctx.storage, now = Date.now();
+		if (path === "/admin-gate") {
+			const want = this.env && typeof this.env.ADMIN_KEY === "string" ? this.env.ADMIN_KEY : "";
+			if (want.length < 12) return J({ ok: 0, e: "off" });
+			const g = (await st.get("gate")) || { fail: 0, lock: 0 };
+			if (g.lock > now) return J({ ok: 0, e: "wait", s: Math.ceil((g.lock - now) / 1000) });
+			if (typeof m.key !== "string" || m.key.length > 200 || (await sha(m.key)) !== (await sha(want))) {
+				g.fail = (g.fail || 0) + 1;
+				if (g.fail >= ADMIN_FAILS) {
+					g.fail = 0;
+					g.lock = now + ADMIN_LOCK;
+				}
+				await st.put("gate", g);
+				return J({ ok: 0, e: "key", left: g.lock > now ? 0 : ADMIN_FAILS - g.fail });
+			}
+			if (g.fail) await st.put("gate", { fail: 0, lock: 0 });
+			return J({ ok: 1 });
+		}
+		if (path === "/admin-list") {
+			const l = [];
+			for (const [k, u] of await st.list({ prefix: "u:", limit: 1000 })) l.push([k.slice(2), u.at || 0, (u.toks || []).length]);
+			return J({ ok: 1, l });
+		}
+		if (path === "/admin-reset") {
+			if (typeof m.id !== "string" || !ACCT_ID.test(m.id)) return J({ ok: 0, e: "id" });
+			const key = "u:" + m.id, u = await st.get(key);
+			if (!u) return J({ ok: 0, e: "none" });
+			const pw = tempPw();
+			u.salt = rand(16);
+			u.h = await pwHash(pw, u.salt);
+			u.toks = []; // 로그인돼 있던 기기 모두 로그아웃 (그 기기의 저장은 'auth' 로 거절된다)
+			u.fail = 0;
+			u.lock = 0;
+			await st.put(key, u);
+			return J({ ok: 1, pw, at: u.at || 0 });
+		}
+		return J({ ok: 0, e: "bad" });
 	}
 
 	// 새 접속. 방이 차 있으면 4001 로 닫는다. 아니면 번호를 주고, 지금 방에 있는 사람들의 마지막 상태(와 이름)를 알려 준다
@@ -174,6 +243,7 @@ export class MyDurableObject extends DurableObject {
 
 	async fetch(request) {
 		if (new URL(request.url).pathname.startsWith("/acct/")) return this.acct(request, new URL(request.url).pathname);
+		if (new URL(request.url).pathname.startsWith("/admin-")) return this.admin(request, new URL(request.url).pathname); // (v10)
 		if (new URL(request.url).pathname === "/where") { // (v6) 이 방이 있는 데이터센터
 			let colo = "?";
 			try {
@@ -457,6 +527,90 @@ export class MyDurableObject extends DurableObject {
 	}
 }
 
+// (v10) 관리자 화면과 관리자 요청
+const ACCT_CH = "abcdefghijklmnopqrstuvwxyz0123456789"; // 계정 방 이름의 끝 글자 (acct-<아이디 첫 글자>)
+async function adminRoute(request, url, ns) {
+	if (url.pathname === "/admin" && request.method === "GET") return new Response(ADMIN_PAGE, { status: 200, headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "x-frame-options": "DENY", "referrer-policy": "no-referrer" } });
+	if (request.method !== "POST" || !/^\/admin\/(list|reset)$/.test(url.pathname)) return J({ ok: 0, e: "bad" }, 404);
+	if (!ns) return J({ ok: 0, e: "server" }, 500);
+	let m = null;
+	try {
+		m = JSON.parse((await request.text()).slice(0, 1000));
+	} catch (e) {
+		m = null;
+	}
+	if (!m || typeof m !== "object" || typeof m.key !== "string") return J({ ok: 0, e: "key" });
+	const call = (name, path, body) => ns.get(ns.idFromName(name), { locationHint: PLACE }).fetch(new Request("https://room" + path, { method: "POST", body: JSON.stringify(body) })).then((r) => r.json());
+	try {
+		const g = await call("admin", "/admin-gate", { key: m.key });
+		if (!g.ok) return J(g);
+		if (url.pathname === "/admin/reset") {
+			if (typeof m.id !== "string" || !ACCT_ID.test(m.id)) return J({ ok: 0, e: "id" });
+			return J(await call("acct-" + m.id[0], "/admin-reset", { id: m.id }));
+		}
+		const parts = await Promise.all([...ACCT_CH].map((c) => call("acct-" + c, "/admin-list", {}).catch(() => ({ ok: 0 }))));
+		const l = [];
+		let miss = 0;
+		for (const r of parts) {
+			if (r && r.ok) l.push(...r.l);
+			else miss++;
+		}
+		l.sort((a, b) => (a[0] < b[0] ? -1 : 1));
+		return J({ ok: 1, l, miss });
+	} catch (e) {
+		return J({ ok: 0, e: "server" }, 500);
+	}
+}
+
+const ADMIN_PAGE = `<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex"><title>Pixelia 관리자</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#141418;color:#ddd;font:16px/1.5 system-ui,sans-serif;padding:18px;max-width:520px;margin:auto}
+h1{font-size:20px;margin:0 0 14px}label{display:block;margin:12px 0 4px;color:#aaa;font-size:14px}
+input{width:100%;padding:12px;font-size:16px;background:#22222a;color:#fff;border:1px solid #444;border-radius:8px}
+button{width:100%;margin-top:12px;padding:13px;font-size:16px;border:0;border-radius:8px;background:#3a3a48;color:#fff}
+button.go{background:#7a2b2b}button:disabled{opacity:.5}
+#out{margin-top:16px;padding:12px;background:#1d1d24;border-radius:8px;min-height:44px;white-space:pre-wrap;word-break:break-all}
+.pw{font:bold 30px monospace;letter-spacing:3px;color:#ffd36b;display:block;margin:8px 0}
+.err{color:#ff8a80}table{width:100%;border-collapse:collapse;font-size:14px}td{padding:6px 4px;border-bottom:1px solid #2c2c36}
+.small{color:#888;font-size:13px}
+</style></head><body>
+<h1>Pixelia 관리자 <span class="small">서버 v10</span></h1>
+<label for="k">관리자 키</label><input id="k" type="password" autocomplete="off">
+<label for="i">아이디</label><input id="i" autocapitalize="off" autocomplete="off" spellcheck="false" maxlength="12" placeholder="영문 소문자·숫자 4~12자">
+<button id="reset" class="go">임시 비밀번호 발급</button>
+<button id="list">아이디 목록 보기</button>
+<div id="out" class="small">관리자 키는 이 화면을 닫으면 지워져요.</div>
+<script>
+const $=(id)=>document.getElementById(id),out=$("out");
+const ERR={key:"관리자 키가 틀렸어요.",off:"관리자 키가 아직 설정되지 않았어요 (Cloudflare의 비밀 값 ADMIN_KEY, 12자 이상).",id:"아이디는 영문 소문자·숫자 4~12자예요.",none:"그런 아이디는 없어요.",server:"서버 오류예요. 잠시 뒤 다시 해 보세요.",bad:"잘못된 요청이에요."};
+function msg(t,err){out.className=err?"err":"";out.textContent=t;}
+function fail(r){let t=ERR[r.e]||("오류: "+r.e);if(r.e==="wait")t="관리자 키를 여러 번 틀려서 "+Math.ceil(r.s/60)+"분 뒤에 다시 할 수 있어요.";if(r.e==="key"&&r.left)t+=" (남은 기회 "+r.left+"번)";if(r.e==="key"&&r.left===0)t+=" 10분 동안 잠겼어요.";msg(t,1);}
+function when(t){if(!t)return"저장 없음";const d=new Date(t),p=(n)=>String(n).padStart(2,"0");return d.getFullYear()+"-"+p(d.getMonth()+1)+"-"+p(d.getDate())+" "+p(d.getHours())+":"+p(d.getMinutes());}
+async function post(path,body){const b=[$("reset"),$("list")];b.forEach(x=>x.disabled=true);try{const r=await fetch(path,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});return await r.json();}catch(e){return{ok:0,e:"server"};}finally{b.forEach(x=>x.disabled=false);}}
+let armed="",armT=0;
+$("reset").onclick=async()=>{
+ const id=$("i").value.trim().toLowerCase();$("i").value=id;
+ if(!/^[a-z0-9]{4,12}$/.test(id))return msg(ERR.id,1);
+ if(armed!==id||Date.now()-armT>5000){armed=id;armT=Date.now();$("reset").textContent="'"+id+"' 정말 바꿀까요? 한 번 더 누르기";return;}
+ armed="";$("reset").textContent="임시 비밀번호 발급";msg("바꾸는 중…");
+ const r=await post("/admin/reset",{key:$("k").value,id});
+ if(!r.ok)return fail(r);
+ out.className="";out.textContent="";
+ out.append(id+"의 임시 비밀번호");const s=document.createElement("span");s.className="pw";s.textContent=r.pw;out.append(s);
+ out.append("마지막 저장: "+when(r.at)+"\\n로그인돼 있던 기기는 모두 로그아웃됐어요. 캐릭터는 그대로예요.\\n이 화면을 닫으면 다시 볼 수 없으니 플레이어에게 바로 전해 주세요.");
+};
+$("i").oninput=()=>{armed="";$("reset").textContent="임시 비밀번호 발급";};
+$("list").onclick=async()=>{
+ msg("불러오는 중…");const r=await post("/admin/list",{key:$("k").value});
+ if(!r.ok)return fail(r);
+ out.className="";out.textContent="계정 "+r.l.length+"개"+(r.miss?" (일부 못 읽음: "+r.miss+")":"");
+ const t=document.createElement("table");
+ for(const [id,at,n] of r.l){const tr=t.insertRow();tr.insertCell().textContent=id;tr.insertCell().textContent=when(at);tr.insertCell().textContent="기기 "+n;tr.onclick=()=>{$("i").value=id;$("i").oninput();};}
+ out.append(t);if(r.l.length)out.append("\\n아이디를 누르면 위 칸에 채워져요.");
+};
+</script></body></html>`;
+
 export default {
 	async fetch(request, env) {
 		const url = new URL(request.url);
@@ -473,6 +627,7 @@ export default {
 			}
 			return new Response(out.join("\n") + "\n(v9 · " + PLACE + " · 이 요청이 들어온 곳 " + ((request.cf && request.cf.colo) || "?") + ")", { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
 		}
+		if (url.pathname === "/admin" || url.pathname.startsWith("/admin/")) return adminRoute(request, url, ns); // (v10) 관리자
 		if (url.pathname.startsWith("/acct/")) { // (v9) 계정
 			if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
 			if (request.method !== "POST" || !/^\/acct\/(signup|login|load|save|logout)$/.test(url.pathname)) return J({ ok: 0, e: "bad" }, 404);
@@ -487,7 +642,7 @@ export default {
 			}
 		}
 		const m = /^\/ws\/(train-(?:[1-9]|1[0-9])|lobby|raid-[a-z0-9]{4,8})$/.exec(url.pathname);
-		if (!m) return new Response("pixel rpg room server: ok (v9) · edge " + ((request.cf && request.cf.colo) || "?"), { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
+		if (!m) return new Response("pixel rpg room server: ok (v9) · edge " + ((request.cf && request.cf.colo) || "?") + " · admin v10", { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
 		if ((request.headers.get("Upgrade") || "").toLowerCase() !== "websocket") return new Response("websocket only", { status: 426 });
 		if (!ns) return new Response("no durable object binding", { status: 500 });
 		return ns.get(ns.idFromName(ROOMS + m[1]), { locationHint: PLACE }).fetch(request); // (v6.2) 새 이름의 방: 처음 만들 땐 동북아시아에
