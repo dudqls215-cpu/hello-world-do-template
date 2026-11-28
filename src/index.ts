@@ -1,5 +1,5 @@
 // @ts-nocheck
-// 픽셀 RPG 방 서버 v6 — Cloudflare Workers + Durable Objects (무료 플랜)
+// 픽셀 RPG 방 서버 v7 — Cloudflare Workers + Durable Objects (무료 플랜)
 // 훈련장 방 하나가 Durable Object 하나다. 접속한 사람이 보낸 "내 상태"(위치·방향·직업·동작)를 같은 방의 다른 사람에게 전달만 한다.
 // 상태 말고 "작은 사건"(예: 적이 공격을 시작함, 허수아비가 맞음)도 전달한다: 이름 하나 + 숫자 몇 개. 무슨 뜻인지는 게임이 정하고, 서버는 모양만 검사한다.
 // (v4) 닉네임: 방 안에서 "내 이름과 번호"를 알리면 기억했다가 새로 온 사람에게도 알려 준다.
@@ -12,10 +12,16 @@
 // (v6.1) 'apac'로 지정했더니 싱가포르(SIN)에 생겼다. 지정을 빼고 이름을 "v7-"로 바꿔 다시 만든다: 지정이 없으면 방은 처음 부른 곳 근처에 생긴다.
 //      서버를 올린 뒤 한국에서 https://<서버 주소>/where?all 을 열면 방 1~9와 로비를 모두 한국 근처에 만들고 위치를 보여 준다.
 // (v6.2) 지정 없이도 싱가포르였다. 2026년 6월에 생긴 'apac-ne'(동북아시아) 지정으로 "v8-" 방을 새로 만든다.
+// (v8) 레이드 대기실: 준비 { t: "rr", v } · 방 사람들 { t: "rm" } → { t: "rm", id, b, l: [[코드, 이름, 직업, 레벨, 준비, 방장]] } · 출발 { t: "rs" } → 모두에게 { t: "rg", id, b } · 못 들어감 { t: "rf" }. 방 10개(train-10: 3층).
+// (v7) 보스 레이드 방: wss://<서버 주소>/ws/raid-<번호> 는 누구나 만들 수 있는 4인 방. 로비가 열린 레이드 방 목록을 알려 준다
+//      (방장: { t: "rc", id, b } · 참여: { t: "rj", id } · 나감: { t: "rx" } · 목록: { t: "rl", b } → { t: "rl", b, l: [[id, 방장 이름, 인원]] }).
+//      작은 일(e)에 붙는 숫자를 6개에서 12개까지로 늘림.
 // (v6.3) 상태 메시지에 높이 y(0~400)를 같이 전한다: 8방향 대쉬로 공중에 떠 있는 모습이 다른 사람 화면에도 보이게.
 // 주소: wss://<서버 주소>/ws/train-1 … train-9 · wss://<서버 주소>/ws/lobby   ·   https://<서버 주소>/ 를 열면 "ok" 가 보인다.
 import { DurableObject } from "cloudflare:workers";
 
+const RAID_CAP = 4; // (v7) 보스 레이드 방의 인원
+const RAID = /^[a-z0-9]{4,8}$/; // (v7) 레이드 방 번호
 const CAP = 12; // 방 하나에 들어갈 수 있는 사람 수. 꽉 차면 닫힘 코드 4001 로 돌려보내고, 게임이 다음 방을 찾는다
 const LOBBY_CAP = 400; // 로비에 동시에 접속할 수 있는 사람 수
 const MAX_LEN = 160; // 받는 메시지의 최대 길이(글자)
@@ -47,7 +53,7 @@ function clean(m) {
 
 // 숫자 목록: 6개 이하, 각각 ±100000 안, 소수 한 자리. 이상하면 null
 function nums(v) {
-	if (!Array.isArray(v) || v.length > 6) return null;
+	if (!Array.isArray(v) || v.length > 12) return null;
 	const out = [];
 	for (const n of v) {
 		if (typeof n !== "number" || !Number.isFinite(n)) return null;
@@ -102,12 +108,12 @@ export class MyDurableObject extends DurableObject {
 			}
 			return new Response("room colo=" + colo, { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
 		}
-		const lobby = new URL(request.url).pathname === "/ws/lobby";
+		const path = new URL(request.url).pathname, lobby = path === "/ws/lobby", raid = path.startsWith("/ws/raid-");
 		const pair = new WebSocketPair();
 		const client = pair[0], server = pair[1];
 		this.sweep(true); // (v5) 들어오기 전에 유령부터 정리 — 새 사람이 받는 명단에 유령이 없게
 		const here = this.ctx.getWebSockets().filter((o) => !this.gone.has(o));
-		if (here.length >= (lobby ? LOBBY_CAP : CAP)) {
+		if (here.length >= (lobby ? LOBBY_CAP : raid ? RAID_CAP : CAP)) {
 			server.accept();
 			server.close(4001, "full");
 			return new Response(null, { status: 101, webSocket: client });
@@ -116,7 +122,7 @@ export class MyDurableObject extends DurableObject {
 		const id = 1 + Math.floor(Math.random() * 2147483646);
 		server.serializeAttachment({ id, s: null, w: 0, n: 0, lobby, u: null, nm: null, c: null, l: 0, at: null, lt: Date.now() });
 		if (lobby) {
-			server.send(JSON.stringify({ t: "hi", id, lobby: 1 }));
+			server.send(JSON.stringify({ t: "hi", id, lobby: 1, v: 8 }));
 			return new Response(null, { status: 101, webSocket: client });
 		}
 		const who = [];
@@ -124,7 +130,7 @@ export class MyDurableObject extends DurableObject {
 			const a = ws.deserializeAttachment();
 			if (a && a.s && !a.lobby) who.push(a.u ? [a.id, a.s, a.nm, a.u] : [a.id, a.s]);
 		}
-		server.send(JSON.stringify({ t: "hi", id, cap: CAP, who, v: 6 }));
+		server.send(JSON.stringify({ t: "hi", id, cap: raid ? RAID_CAP : CAP, who, v: 8 }));
 		return new Response(null, { status: 101, webSocket: client });
 	}
 
@@ -206,6 +212,68 @@ export class MyDurableObject extends DurableObject {
 		}
 		ws.serializeAttachment(at);
 		if (!at.u) return; // 자기소개 전에는 묻거나 쪽지를 보낼 수 없다
+		if (m.t === "rc" || m.t === "rj" || m.t === "rx") { // (v7) 레이드 방: 만들기 · 참여 · 나감 · (v8) 가득 찼거나 이미 출발한 방에는 못 들어간다
+			at.rd = null;
+			if (m.t !== "rx" && typeof m.id === "string" && RAID.test(m.id)) {
+				if (m.t === "rc" && (m.b === "boss" || m.b === "boss2")) at.rd = { id: m.id, b: m.b, h: 1, r: 0, s: 0 };
+				else {
+					let n = 0, started = 0, b = "";
+					for (const o of this.ctx.getWebSockets()) {
+						if (o === ws || (this.gone && this.gone.has(o))) continue;
+						const a = o.deserializeAttachment();
+						if (a && a.rd && a.rd.id === m.id) { n++; if (a.rd.s) started = 1; if (a.rd.h) b = a.rd.b; }
+					}
+					if (m.re !== 1 && (n >= RAID_CAP || started || !b)) { try { ws.send(JSON.stringify({ t: "rf", id: m.id, why: !b ? 2 : started ? 1 : 0 })); } catch (e) { /* closing */ } }
+					else at.rd = { id: m.id, h: 0, r: 0, s: m.re === 1 ? 1 : 0 };
+				}
+			}
+			ws.serializeAttachment(at);
+			return;
+		}
+		if (m.t === "rr") { // (v8) 준비 완료 / 취소
+			if (at.rd) { at.rd.r = m.v ? 1 : 0; ws.serializeAttachment(at); }
+			return;
+		}
+		if (m.t === "rm" || m.t === "rs") { // (v8) 내 레이드 방의 사람들 · 방장의 출발 신호
+			if (!at.rd) return;
+			const mem = [];
+			for (const o of this.ctx.getWebSockets()) {
+				if (this.gone && this.gone.has(o)) continue;
+				const a = o === ws ? at : o.deserializeAttachment();
+				if (a && a.rd && a.rd.id === at.rd.id) mem.push([o, a]);
+			}
+			if (m.t === "rs") {
+				if (!at.rd.h || mem.some(([, a]) => !a.rd.h && !a.rd.r)) return; // 방장만, 모두 준비했을 때만
+				for (const [o, a] of mem) {
+					a.rd.s = 1;
+					o.serializeAttachment(a);
+					try { o.send(JSON.stringify({ t: "rg", id: at.rd.id, b: at.rd.b })); } catch (e) { /* closing */ }
+				}
+				return;
+			}
+			const host = mem.find(([, a]) => a.rd.h);
+			try { ws.send(JSON.stringify({ t: "rm", id: at.rd.id, b: host ? host[1].rd.b : "", l: mem.slice(0, RAID_CAP + 2).map(([, a]) => [a.u, a.nm, a.c, a.l, a.rd.r ? 1 : 0, a.rd.h ? 1 : 0]) })); } catch (e) { /* closing */ }
+			return;
+		}
+		if (m.t === "rl") { // (v7) 열린 레이드 방 목록 (자리가 남고 아직 출발하지 않은 것만)
+			if (m.b !== "boss" && m.b !== "boss2") return;
+			const rooms = new Map(), count = new Map(), gone = new Set();
+			for (const o of this.ctx.getWebSockets()) {
+				if (this.gone && this.gone.has(o)) continue;
+				const a = o.deserializeAttachment();
+				if (!a || !a.rd) continue;
+				count.set(a.rd.id, (count.get(a.rd.id) || 0) + 1);
+				if (a.rd.s) gone.add(a.rd.id);
+				if (a.rd.h && a.rd.b === m.b) rooms.set(a.rd.id, a.nm);
+			}
+			const l = [...rooms.entries()].filter(([id]) => !gone.has(id)).map(([id, nm]) => [id, nm, count.get(id) || 1]).filter((r) => r[2] < RAID_CAP).slice(0, 12);
+			try {
+				ws.send(JSON.stringify({ t: "rl", b: m.b, l }));
+			} catch (e) {
+				// closing
+			}
+			return;
+		}
 		if (m.t === "q") {
 			if (!Array.isArray(m.l) || m.l.length > 12) return;
 			const want = new Set(m.l.filter((u) => typeof u === "string" && CODE.test(u)));
@@ -327,10 +395,10 @@ export default {
 					out.push(n + ": ?");
 				}
 			}
-			return new Response(out.join("\n") + "\n(v6.3 · " + PLACE + " · 이 요청이 들어온 곳 " + ((request.cf && request.cf.colo) || "?") + ")", { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
+			return new Response(out.join("\n") + "\n(v8 · " + PLACE + " · 이 요청이 들어온 곳 " + ((request.cf && request.cf.colo) || "?") + ")", { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
 		}
-		const m = /^\/ws\/(train-[1-9]|lobby)$/.exec(url.pathname);
-		if (!m) return new Response("pixel rpg room server: ok (v6.3) · edge " + ((request.cf && request.cf.colo) || "?"), { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
+		const m = /^\/ws\/(train-(?:[1-9]|1[0-9])|lobby|raid-[a-z0-9]{4,8})$/.exec(url.pathname);
+		if (!m) return new Response("pixel rpg room server: ok (v8) · edge " + ((request.cf && request.cf.colo) || "?"), { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
 		if ((request.headers.get("Upgrade") || "").toLowerCase() !== "websocket") return new Response("websocket only", { status: 426 });
 		if (!ns) return new Response("no durable object binding", { status: 500 });
 		return ns.get(ns.idFromName(ROOMS + m[1]), { locationHint: PLACE }).fetch(request); // (v6.2) 새 이름의 방: 처음 만들 땐 동북아시아에
