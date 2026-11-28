@@ -1,5 +1,9 @@
 // @ts-nocheck
-// 픽셀 RPG 방 서버 v7 — Cloudflare Workers + Durable Objects (무료 플랜)
+// 픽셀 RPG 방 서버 v9 — Cloudflare Workers + Durable Objects (무료 플랜)
+// (v9) 계정: POST https://<서버 주소>/acct/signup · login · load · save · logout (본문은 JSON 글). 아이디(영문 소문자·숫자 4~12자)와 비밀번호(4~32자).
+//      비밀번호는 저장하지 않는다 — 소금(salt)을 섞어 여러 번 해시한 값만 둔다. 로그인하면 열쇠(tok)를 주고, 그 뒤로는 열쇠로 저장을 읽고 쓴다(기기 5대까지).
+//      저장은 글 한 덩어리(6만 자까지)와 판 번호(rev). 내가 아는 판 번호가 서버와 다르면(다른 기기가 먼저 저장) 덮어쓰지 않고 서버의 것을 돌려준다.
+//      계정은 방과 다른 Durable Object(acct-<아이디 첫 글자>)의 저장소에 둔다 — 방 이름(ROOMS)을 바꿔도 계정은 남는다.
 // 훈련장 방 하나가 Durable Object 하나다. 접속한 사람이 보낸 "내 상태"(위치·방향·직업·동작)를 같은 방의 다른 사람에게 전달만 한다.
 // 상태 말고 "작은 사건"(예: 적이 공격을 시작함, 허수아비가 맞음)도 전달한다: 이름 하나 + 숫자 몇 개. 무슨 뜻인지는 게임이 정하고, 서버는 모양만 검사한다.
 // (v4) 닉네임: 방 안에서 "내 이름과 번호"를 알리면 기억했다가 새로 온 사람에게도 알려 준다.
@@ -36,6 +40,20 @@ const CLASS = /^[a-z]{2}$/; // 직업 이름은 영문 소문자 두 글자면 �
 const CODE = /^[a-z0-9]{8}$/; // (v4) 사람 번호: 게임이 기기마다 한 번 만든 영문 소문자·숫자 8자
 const NAME = /^[가-힣a-zA-Z0-9]{1,12}$/; // (v4) 닉네임: 한글·영문·숫자 12자까지
 const WHERE = /^[a-z]{1,8}-[1-9]$/; // (v4) 어디 있는지: 장소 이름-방 번호 (예: lab-3)
+const ACCT_ID = /^[a-z0-9]{4,12}$/; // (v9) 계정 아이디
+const ACCT_MAX = 60000; // (v9) 저장 한 덩어리의 최대 길이(글자)
+const ACCT_ITER = 2000; // (v9) 비밀번호 해시 반복 수 (무료 플랜의 요청당 계산 시간 안에서)
+const CORS = { "content-type": "application/json; charset=utf-8", "access-control-allow-origin": "*", "access-control-allow-methods": "POST, OPTIONS", "access-control-allow-headers": "content-type", "cache-control": "no-store" };
+const J = (o, status) => new Response(JSON.stringify(o), { status: status || 200, headers: CORS });
+const hex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+const rand = (n) => hex(crypto.getRandomValues(new Uint8Array(n)));
+async function sha(t) {
+	return hex(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(t)));
+}
+async function pwHash(pw, salt) {
+	const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(pw), "PBKDF2", false, ["deriveBits"]);
+	return hex(await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt: new TextEncoder().encode(salt), iterations: ACCT_ITER }, key, 256));
+}
 const NOTE = /^[a-z0-9,]{0,60}$/; // (v4) 쪽지에 붙는 짧은 글(파티원 번호 목록 등)
 
 // 받은 상태를 검사해서 깨끗한 값만 남긴다. 이상하면 null (전달하지 않음)
@@ -97,7 +115,65 @@ export class MyDurableObject extends DurableObject {
 	}
 
 	// 새 접속. 방이 차 있으면 4001 로 닫는다. 아니면 번호를 주고, 지금 방에 있는 사람들의 마지막 상태(와 이름)를 알려 준다
+	// (v9) 계정: 만들기 · 로그인 · 읽기 · 저장 · 로그아웃
+	async acct(request, path) {
+		let m = null;
+		try {
+			m = JSON.parse((await request.text()).slice(0, ACCT_MAX + 2000));
+		} catch (e) {
+			return J({ ok: 0, e: "bad" });
+		}
+		if (!m || typeof m !== "object" || typeof m.id !== "string" || !ACCT_ID.test(m.id)) return J({ ok: 0, e: "id" });
+		const st = this.ctx.storage, key = "u:" + m.id, now = Date.now();
+		let u = await st.get(key);
+		if (path === "/acct/signup") {
+			if (typeof m.pw !== "string" || m.pw.length < 4 || m.pw.length > 32) return J({ ok: 0, e: "pw" });
+			if (u) return J({ ok: 0, e: "taken" });
+			const salt = rand(16), tok = rand(24);
+			u = { salt, h: await pwHash(m.pw, salt), toks: [await sha(tok)], rev: 0, data: null, at: now, fail: 0, lock: 0 };
+			await st.put(key, u);
+			return J({ ok: 1, tok, rev: 0, data: null });
+		}
+		if (path === "/acct/login") {
+			if (!u) return J({ ok: 0, e: "wrong" });
+			if (u.lock > now) return J({ ok: 0, e: "wait", s: Math.ceil((u.lock - now) / 1000) });
+			if (typeof m.pw !== "string" || m.pw.length > 32 || (await pwHash(m.pw, u.salt)) !== u.h) {
+				u.fail = (u.fail || 0) + 1;
+				if (u.fail >= 5) {
+					u.fail = 0;
+					u.lock = now + 60000; // 다섯 번 틀리면 1분 쉰다
+				}
+				await st.put(key, u);
+				return J({ ok: 0, e: "wrong" });
+			}
+			const tok = rand(24);
+			u.fail = 0;
+			u.toks = [...u.toks, await sha(tok)].slice(-5);
+			await st.put(key, u);
+			return J({ ok: 1, tok, rev: u.rev, data: u.data });
+		}
+		if (!u || typeof m.tok !== "string" || !u.toks.includes(await sha(m.tok))) return J({ ok: 0, e: "auth" });
+		if (path === "/acct/load") return J({ ok: 1, rev: u.rev, data: u.data });
+		if (path === "/acct/save") {
+			if (typeof m.data !== "string" || m.data.length > ACCT_MAX) return J({ ok: 0, e: "big" });
+			if (u.data !== null && Math.floor(Number(m.rev)) !== u.rev) return J({ ok: 0, e: "conflict", rev: u.rev, data: u.data });
+			u.data = m.data;
+			u.rev = (u.rev || 0) + 1;
+			u.at = now;
+			await st.put(key, u);
+			return J({ ok: 1, rev: u.rev });
+		}
+		if (path === "/acct/logout") {
+			const h = await sha(m.tok);
+			u.toks = u.toks.filter((t) => t !== h);
+			await st.put(key, u);
+			return J({ ok: 1 });
+		}
+		return J({ ok: 0, e: "bad" });
+	}
+
 	async fetch(request) {
+		if (new URL(request.url).pathname.startsWith("/acct/")) return this.acct(request, new URL(request.url).pathname);
 		if (new URL(request.url).pathname === "/where") { // (v6) 이 방이 있는 데이터센터
 			let colo = "?";
 			try {
@@ -122,7 +198,7 @@ export class MyDurableObject extends DurableObject {
 		const id = 1 + Math.floor(Math.random() * 2147483646);
 		server.serializeAttachment({ id, s: null, w: 0, n: 0, lobby, u: null, nm: null, c: null, l: 0, at: null, lt: Date.now() });
 		if (lobby) {
-			server.send(JSON.stringify({ t: "hi", id, lobby: 1, v: 8 }));
+			server.send(JSON.stringify({ t: "hi", id, lobby: 1, v: 9 }));
 			return new Response(null, { status: 101, webSocket: client });
 		}
 		const who = [];
@@ -130,7 +206,7 @@ export class MyDurableObject extends DurableObject {
 			const a = ws.deserializeAttachment();
 			if (a && a.s && !a.lobby) who.push(a.u ? [a.id, a.s, a.nm, a.u] : [a.id, a.s]);
 		}
-		server.send(JSON.stringify({ t: "hi", id, cap: raid ? RAID_CAP : CAP, who, v: 8 }));
+		server.send(JSON.stringify({ t: "hi", id, cap: raid ? RAID_CAP : CAP, who, v: 9 }));
 		return new Response(null, { status: 101, webSocket: client });
 	}
 
@@ -395,10 +471,23 @@ export default {
 					out.push(n + ": ?");
 				}
 			}
-			return new Response(out.join("\n") + "\n(v8 · " + PLACE + " · 이 요청이 들어온 곳 " + ((request.cf && request.cf.colo) || "?") + ")", { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
+			return new Response(out.join("\n") + "\n(v9 · " + PLACE + " · 이 요청이 들어온 곳 " + ((request.cf && request.cf.colo) || "?") + ")", { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
+		}
+		if (url.pathname.startsWith("/acct/")) { // (v9) 계정
+			if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
+			if (request.method !== "POST" || !/^\/acct\/(signup|login|load|save|logout)$/.test(url.pathname)) return J({ ok: 0, e: "bad" }, 404);
+			if (!ns) return J({ ok: 0, e: "server" }, 500);
+			const body = (await request.text()).slice(0, ACCT_MAX + 2000);
+			const idm = /"id"\s*:\s*"([a-z0-9]{4,12})"/.exec(body);
+			if (!idm) return J({ ok: 0, e: "id" });
+			try {
+				return await ns.get(ns.idFromName("acct-" + idm[1][0]), { locationHint: PLACE }).fetch(new Request("https://room" + url.pathname, { method: "POST", body }));
+			} catch (e) {
+				return J({ ok: 0, e: "server" }, 500);
+			}
 		}
 		const m = /^\/ws\/(train-(?:[1-9]|1[0-9])|lobby|raid-[a-z0-9]{4,8})$/.exec(url.pathname);
-		if (!m) return new Response("pixel rpg room server: ok (v8) · edge " + ((request.cf && request.cf.colo) || "?"), { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
+		if (!m) return new Response("pixel rpg room server: ok (v9) · edge " + ((request.cf && request.cf.colo) || "?"), { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
 		if ((request.headers.get("Upgrade") || "").toLowerCase() !== "websocket") return new Response("websocket only", { status: 426 });
 		if (!ns) return new Response("no durable object binding", { status: 500 });
 		return ns.get(ns.idFromName(ROOMS + m[1]), { locationHint: PLACE }).fetch(request); // (v6.2) 새 이름의 방: 처음 만들 땐 동북아시아에
